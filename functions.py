@@ -1,80 +1,377 @@
-import scanpy as sc
-import pandas as pd
 import matplotlib.pyplot as plt
-import seaborn as sns
 import numpy as np
+import pandas as pd
+import scanpy as sc
+from numbers import Real
+from pathlib import Path
+from scipy.spatial import cKDTree
 
-# Vilasini Gopal Functions
 
-def filter_data(spatial_data, min_counts=5000, max_counts=35000, min_cells=10):
+# AI was used to set up this directory location info
+DEFAULT_DATA_DIR = (
+    Path(__file__).resolve().parent / "data" / "V1_Human_Lymph_Node"
+)
+
+
+def load_data(data_dir=DEFAULT_DATA_DIR):
+    """Load the Visium data from a folder.
+
+    Inputs:
+    data_dir : str | pathlib.Path
+
+    Outputs:
+    anndata.AnnData
     """
-    This function should filter low-quality spatial spots and genes
+    data_path = Path(data_dir).expanduser().resolve()
+    if not data_path.is_dir():
+        raise FileNotFoundError(f"Visium data directory does not exist: {data_path}")
+    matrix_path = data_path / "filtered_feature_bc_matrix.h5"
+    if not matrix_path.is_file():
+        raise FileNotFoundError(f"Visium matrix file does not exist: {matrix_path}")
 
-    Parameters:
-        spatial_data: contains an AnnData (Annotated Data) object that has spatial transcriptomics data
-        (AnnData is a data structure in Scanpy that stores gene expression measurements and their metadata)
-        min_counts: stores the minimum total counts required per spot
-        max_counts: stores the maximum total coutns allowed per spot
-        min_cells: stores the minimum number of spots needed to detect a gene
+    adata = sc.read_visium(data_path)
+    adata.var_names_make_unique()
+    return adata
 
-    Returns:
-        The filtered AnnData object
+
+def calculate_qc_metrics(adata):
+    """Add mitochondrial labels and QC measurements to a copy of the data.
+
+    Inputs:
+    adata : anndata.AnnData
+
+    Outputs:
+    anndata.AnnData
     """
-    # Validate the filtering parameters
-    if min_counts < 0 or max_counts < 0:
-        raise ValueError("Count thresholds cannot be negative")
+    result = adata.copy()
+    result.var["mt"] = result.var_names.str.startswith("MT-")
+    sc.pp.calculate_qc_metrics(result, qc_vars=["mt"], inplace=True)
+    return result
+
+
+def plot_histograms(adata, bins=40, show=True):
+    """Plot histograms for total counts and detected genes per spot.
+
+    Inputs:
+    adata : anndata.AnnData
+    bins : int
+    show : bool
+
+    Outputs:
+    matplotlib.figure.Figure
+    """
+    required = ("total_counts", "n_genes_by_counts")
+    missing = [column for column in required if column not in adata.obs]
+    if missing:
+        raise KeyError(f"QC metrics are missing from adata.obs: {missing}")
+    if bins <= 0:
+        raise ValueError("bins must be a positive integer")
+
+    figure, axes = plt.subplots(1, 2, figsize=(10, 4))
+    axes[0].hist(adata.obs["total_counts"].dropna(), bins=bins)
+    axes[0].set(xlabel="Total Counts", ylabel="Number of Spots", title="Total Counts per Spot")
+    axes[1].hist(adata.obs["n_genes_by_counts"].dropna(), bins=bins)
+    axes[1].set(xlabel="Number of Genes", ylabel="Number of Spots", title="Detected Genes per Spot")
+    figure.tight_layout()
+    if show:
+        plt.show()
+    return figure
+
+
+# This new version of filter_data() is a combination of versions of filter_data() from the two branches (vilasini, function/Immune_Score_Neighbors)
+def filter_data(adata, min_counts=5000, max_counts=35000, min_cells=10):
+    """Filter low-quality spatial spots and genes using thresholds you rpovide.
     
-    if min_counts >= max_counts:
+    Inputs:
+    adata : anndata.AnnData
+    min_counts : int | None
+    max_counts : int | None
+    min_cells : int | None
+
+    Outputs:
+    anndata.AnnData
+    """
+
+    # Validate filtering thresholds
+    for name, value in {
+        "min_counts": min_counts,
+        "max_counts": max_counts,
+        "min_cells": min_cells
+    }.items():
+        if value is not None and value < 0:
+            raise ValueError(f"{name} cannot be negative")
+
+    if (min_counts is not None and max_counts is not None and min_counts >= max_counts):
         raise ValueError("min_counts must be smaller than max_counts")
 
-    if min_cells < 1:
+    if min_cells is not None and min_cells < 1:
         raise ValueError("min_cells must be at least 1")
-    
-    # Create a copy of the original dataset
-    filtered_data = spatial_data.copy()
 
-    # Identify mitochondrial genes
-    filtered_data.var["mt"] = filtered_data.var_names.str.startswith("MT-")
+    # Work on a copy to preserve the original dataset
+    filtered_data = adata.copy()
 
-    # Calculate the quality control metrics for each spatial spot, including total RNA counts,
-    # number of genes detected, and the percentage of mitochondrial genes
-    # inplace = True stores these metrics in the AnnData object's metadata
-    sc.pp.calculate_qc_metrics(filtered_data, qc_vars = ["mt"], inplace = True)
+    # Calculate QC metrics only when needed
+    required_metrics = {
+        "total_counts",
+        "n_genes_by_counts",
+        "pct_counts_mt"
+    }
 
-    # Filter out low-quality spatial spots based on their total RNA counts
-    sc.pp.filter_cells(filtered_data, min_counts = min_counts)
-    sc.pp.filter_cells(filtered_data, max_counts = max_counts)
+    if not required_metrics.issubset(filtered_data.obs.columns):
+        filtered_data.var["mt"] = (filtered_data.var_names.str.startswith("MT-"))
 
-    # Filter genes by removing genes detected in fewer than the specified number of spots
-    sc.pp.filter_genes(filtered_data, min_cells = min_cells)
+        sc.pp.calculate_qc_metrics(filtered_data, qc_vars=["mt"], percent_top=None, inplace=True)
+
+    # Filter spatial spots
+    if min_counts is not None:
+        sc.pp.filter_cells(filtered_data, min_counts=min_counts)
+
+    if max_counts is not None:
+        sc.pp.filter_cells(filtered_data, max_counts=max_counts)
+
+    # Filter genes
+    if min_cells is not None:
+        sc.pp.filter_genes(filtered_data, min_cells=min_cells)
 
     return filtered_data
 
-def normalize_data(filtered_data, target_sum = 10000):
+
+def normalize_data(adata, target_sum=1e4):
+    """Normalize and log-transform a copy while keeping the original counts.
+
+    Inputs:
+    adata : anndata.AnnData
+    target_sum : float | None
+
+    Outputs:
+    anndata.AnnData
     """
-    Normalize gene expression counts across spatial spots.
+    if target_sum is not None and target_sum <= 0:
+        raise ValueError("target_sum must be positive or None")
+    result = adata.copy()
+    result.layers["counts"] = result.X.copy()
+    sc.pp.normalize_total(result, target_sum=target_sum)
+    sc.pp.log1p(result)
+    return result
 
-    Parameters:
-        filtered_data: AnnData object containing filtered spatial transcriptomics data.
-        target_sum: Target total expression count for each spot after normalization.
 
-    Returns:
-        Normalized AnnData object
-        (adjusts gene expression values to account for differences in total coutns across spacial spots)
+def plot_marker_genes(adata, genes=("CD3D", "MS4A1", "CD68"), show=True, **kwargs):
+    """Show where the selected marker genes appear across the tissue.
+
+    Inputs:
+    adata : anndata.AnnData
+    genes : tuple[str, ...] | list[str]
+    show : bool
+    kwargs : dict[str, object]
+
+    Outputs:
+    matplotlib.axes.Axes | list[matplotlib.axes.Axes] | None
     """
+    genes = list(genes)
+    if not genes:
+        raise ValueError("At least one marker gene must be provided")
+    missing = [gene for gene in genes if gene not in adata.var_names]
+    if missing:
+        raise KeyError(f"Marker genes not found in adata.var_names: {missing}")
+    return sc.pl.spatial(adata, color=genes, show=show, **kwargs)
 
-    if target_sum <= 0:
-        raise ValueError("target_sum must be greater than zero")
 
-    normalized_data = filtered_data.copy()
+def run_analysis(
+    data_dir=DEFAULT_DATA_DIR,
+    min_counts=5000,
+    max_counts=35000,
+    min_cells=10,
+    target_sum=1e4,
+    show_plots=True,
+):
+    """Load, check, filter, and normalize the data in one go.
 
-    # Normalize total counts across spacial spots
-    sc.pp.normalize_total(normalized_data, target_sum = target_sum)
+    Inputs:
+    data_dir : str | pathlib.Path
+    min_counts : int | None
+    max_counts : int | None
+    min_cells : int | None
+    target_sum : float | None
+    show_plots : bool
 
-    # Apply a logarithmic transformation to reduce the effect of highly expressed genes
-    sc.pp.log1p(normalized_data)
+    Outputs:
+    anndata.AnnData
+    """
+    adata = calculate_qc_metrics(load_data(data_dir))
+    if show_plots:
+        plot_histograms(adata)
+    filtered = filter_data(adata, min_counts, max_counts, min_cells)
+    if show_plots:
+        plot_histograms(filtered)
+    normalized = normalize_data(filtered, target_sum=target_sum)
+    return normalized
 
-    return normalized_data
+
+def find_neighbors(adata, radius, spatial_key="spatial", include_self=False):
+    """Find the spots within a set distance of each spot.
+
+    Inputs:
+    adata : anndata.AnnData
+    radius : int | float
+    spatial_key : str
+    include_self : bool
+
+    Outputs:
+    dict[str, list[str]]
+    """
+    if not isinstance(radius, Real) or not np.isfinite(radius) or radius < 0:
+        raise ValueError("radius must be a finite, non-negative number")
+    if spatial_key not in adata.obsm:
+        raise KeyError(f"Coordinates not found in adata.obsm[{spatial_key!r}]")
+    if not adata.obs_names.is_unique:
+        raise ValueError("adata.obs_names must be unique to identify spots")
+
+    coordinates = np.asarray(adata.obsm[spatial_key], dtype=float)
+    if (
+        coordinates.ndim != 2
+        or coordinates.shape[0] != adata.n_obs
+        or coordinates.shape[1] < 2
+    ):
+        raise ValueError("Spatial coordinates must have shape (n_spots, >=2)")
+    if not np.isfinite(coordinates).all():
+        raise ValueError("Spatial coordinates must contain only finite values")
+    if adata.n_obs == 0:
+        return {}
+
+    tree = cKDTree(coordinates)
+    neighbor_indices_by_spot = tree.query_ball_point(coordinates, r=float(radius))
+    spot_names = adata.obs_names
+    neighbors = {}
+
+    for spot_index, candidate_indices in enumerate(neighbor_indices_by_spot):
+        # Save each distance so we can list neighbors from nearest to farthest.
+        selected_neighbors = []
+        for candidate_index in candidate_indices:
+            if not include_self and candidate_index == spot_index:
+                continue
+
+            difference = coordinates[spot_index] - coordinates[candidate_index]
+            distance = np.linalg.norm(difference)
+            selected_neighbors.append((float(distance), candidate_index))
+
+        selected_neighbors.sort()
+
+        neighbor_names = []
+        for distance, candidate_index in selected_neighbors:
+            neighbor_names.append(spot_names[candidate_index])
+
+        neighbors[spot_names[spot_index]] = neighbor_names
+
+    return neighbors
+
+
+def calculate_neighbor_scores(adata, neighbors, immune_score_key):
+    """Average the immune scores of each spot's neighbors.
+
+    Inputs:
+    adata : anndata.AnnData
+    neighbors : dict[str, list[str]]
+    immune_score_key : str
+
+    Outputs:
+    pandas.Series
+    """
+    if immune_score_key not in adata.obs:
+        raise KeyError(f"Immune score column {immune_score_key!r} not found in adata.obs")
+    scores = pd.to_numeric(adata.obs[immune_score_key], errors="coerce")
+    if not adata.obs_names.is_unique:
+        raise ValueError("adata.obs_names must be unique to identify spots")
+    if not isinstance(neighbors, dict):
+        raise TypeError("neighbors must be the mapping returned by find_neighbors")
+
+    unknown_spots = set(neighbors).difference(adata.obs_names)
+    if unknown_spots:
+        raise ValueError(
+            f"Neighbor mapping contains unknown spot names: {list(unknown_spots)[:5]}"
+        )
+
+    neighbor_scores = pd.Series(
+        np.nan,
+        index=adata.obs_names,
+        dtype=float,
+        name="neighbor_score",
+    )
+
+    for spot_name in adata.obs_names:
+        neighbor_names = neighbors.get(spot_name, [])
+        unknown_neighbors = set(neighbor_names).difference(adata.obs_names)
+        if unknown_neighbors:
+            raise ValueError(
+                f"Neighbors for {spot_name!r} contain unknown spots: "
+                f"{list(unknown_neighbors)[:5]}"
+            )
+
+        score_total = 0.0
+        score_count = 0
+        for neighbor_name in neighbor_names:
+            score = float(scores.loc[neighbor_name])
+            if np.isfinite(score):
+                score_total += score
+                score_count += 1
+
+        if score_count > 0:
+            neighbor_scores.loc[spot_name] = score_total / score_count
+
+    return neighbor_scores
+
+
+def calculate_spot_scores(
+    adata,
+    immune_score_key,
+    neighbor_score_key="neighbor_score",
+    neighbor_weight=0.5,
+    output_key="combined_immune_score",
+):
+    """Mix each spot's score with the average score of its neighbors.
+
+    Inputs:
+    adata : anndata.AnnData
+    immune_score_key : str
+    neighbor_score_key : str
+    neighbor_weight : int | float
+    output_key : str
+
+    Outputs:
+    anndata.AnnData
+    """
+    if immune_score_key not in adata.obs:
+        raise KeyError(f"Immune score column {immune_score_key!r} not found in adata.obs")
+    if neighbor_score_key not in adata.obs:
+        raise KeyError(f"Neighbor score column {neighbor_score_key!r} not found in adata.obs")
+    if not isinstance(neighbor_weight, Real) or not np.isfinite(neighbor_weight):
+        raise ValueError("neighbor_weight must be a finite number between 0 and 1")
+    if not 0 <= neighbor_weight <= 1:
+        raise ValueError("neighbor_weight must be between 0 and 1 inclusive")
+    if not isinstance(output_key, str) or not output_key:
+        raise ValueError("output_key must be a non-empty string")
+
+    own_scores = pd.to_numeric(adata.obs[immune_score_key], errors="coerce").astype(float)
+    neighbor_scores = pd.to_numeric(
+        adata.obs[neighbor_score_key], errors="coerce"
+    ).astype(float)
+    combined_scores = own_scores.copy()
+    own_weight = 1.0 - float(neighbor_weight)
+
+    for spot_name in adata.obs_names:
+        own_score = own_scores.loc[spot_name]
+        neighbor_score = neighbor_scores.loc[spot_name]
+
+        # If there is no usable neighborhood average, preserve the own score.
+        if np.isfinite(neighbor_score):
+            combined_scores.loc[spot_name] = (
+                own_weight * own_score
+                + float(neighbor_weight) * neighbor_score
+            )
+
+    result = adata.copy()
+    result.obs[output_key] = combined_scores
+    return result
+
 
 def create_immune_dictionary():
     """
@@ -115,7 +412,8 @@ def create_immune_dictionary():
         
     return immune_dictionary
 
-def calculate_immune_scores(normalized_data, immune_dictionary):
+
+ def calculate_immune_scores(normalized_data, immune_dictionary):
     """
 
     Calculate immune cell type scores for each spatial spot using 
@@ -172,3 +470,4 @@ def calculate_immune_scores(normalized_data, immune_dictionary):
         scored_data.obs[f"{cell_type}_score"] = immune_score
 
     return scored_data
+
