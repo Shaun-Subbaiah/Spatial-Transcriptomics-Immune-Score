@@ -119,7 +119,7 @@ def calculate_immune_scores(normalized_data, immune_dictionary):
     """
 
     Calculate immune cell type scores for each spatial spot using 
-    the normalized expression of marker genes
+    the normalized expression of marker genes and marker detection consistency
 
     Parameters:
         normalized_data: Normalized AnnData object.
@@ -128,6 +128,8 @@ def calculate_immune_scores(normalized_data, immune_dictionary):
     Returns:
         AnnData object with immune scores added to .obs.
         The .obs stores observations(in this case spatial spots)
+        Each score accounts for average marker expression and the 
+        proportion of detected marker genes
     """
 
     if not isinstance(normalized_data, sc.AnnData):
@@ -155,18 +157,30 @@ def calculate_immune_scores(normalized_data, immune_dictionary):
 
         # go through each spatial spot in the dataset
         for spot in range(expression.shape[0]):
-            # start the total expression at 0
+            # start the total expression and detected markers at 0
             total = 0
+            detected_markers = 0
+
             # go through each marker gene for the current spot
             for gene in range(expression.shape[1]):
                 # add the gene's expression value to the total
                 total += expression[spot, gene]
 
-            # divide the total by the total number of marker genes to get the average
-            average = total / expression.shape[1]
+                # Count markers with nonzero expression
+                if expression[spot, gene] > 0:
+                    detected_markers += 1
 
-            # add the average expression to the immune score list
-            immune_score.append(average)
+            # divide the total by the total number of marker genes to calculate average expression
+            average = total / len(genes)
+
+            # Calculate the proportion of detected markers
+            consistency = detected_markers / len(genes)
+
+            # Multiply average expression by marker consistency 
+            score = average * consistency
+
+            # add score to the immune score list
+            immune_score.append(score)
 
         # Store scores in the spot metadata
         scored_data.obs[f"{cell_type}_score"] = immune_score
